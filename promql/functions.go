@@ -150,7 +150,7 @@ func funcIrate(ev *evaluator, args Expressions) model.Value {
 	return instantValue(ev, args[0], true)
 }
 
-// === idelta(node model.ValMatric) Vector ===
+// === idelta(node model.ValMatrix) Vector ===
 func funcIdelta(ev *evaluator, args Expressions) model.Value {
 	return instantValue(ev, args[0], false)
 }
@@ -678,7 +678,10 @@ func funcDeriv(ev *evaluator, args Expressions) model.Value {
 		if len(samples.Values) < 2 {
 			continue
 		}
-		slope, _ := linearRegression(samples.Values, 0)
+		// We pass in an arbitrary timestamp that is near the values in use
+		// to avoid floating point accuracy issues, see
+		// https://github.com/prometheus/prometheus/issues/2674
+		slope, _ := linearRegression(samples.Values, samples.Values[0].Timestamp)
 		resultSample := &sample{
 			Metric:    samples.Metric,
 			Value:     slope,
@@ -911,8 +914,9 @@ func dateWrapper(ev *evaluator, args Expressions, f func(time.Time) model.Sample
 	if len(args) == 0 {
 		v = vector{
 			&sample{
-				Metric: metric.Metric{},
-				Value:  model.SampleValue(ev.Timestamp.Unix()),
+				Metric:    metric.Metric{},
+				Value:     model.SampleValue(ev.Timestamp.Unix()),
+				Timestamp: ev.Timestamp,
 			},
 		}
 	} else {
