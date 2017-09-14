@@ -1,9 +1,9 @@
 package writer
 
 import (
+	//	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 	"unicode/utf8"
 )
 
@@ -26,12 +26,12 @@ type SafeWriter struct {
 
 	err error
 	buf []byte
-	n   int64
+	n   int
 	wr  io.Writer
 
 	// Number of bytes being flushed from the start of buf. Only non-zero when a
 	// flush is in progress, always <= n.
-	nFlushing int64
+	nFlushing int
 }
 
 // NewSafeWriterSize returns a new SafeWriter whose buffer has at least the
@@ -76,63 +76,104 @@ func (b *SafeWriter) Reset(w io.Writer) {
 func (b *SafeWriter) Flush() error {
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
-	return b.flush(len(b.buf))
+	return b.flush(false)
 }
 
-func (b *SafeWriter) flush(needed int) error {
+func (b *SafeWriter) flush(blocking bool) error {
+	//	fmt.Printf("needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
+	if b.err != nil {
+		return b.err
+	}
+
+	// Wait while another flush in progress
+	for b.err == nil && b.nFlushing != 0 {
+		b.cond.Wait()
+		//	fmt.Printf(" w needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
+		continue
+	}
+	// TODO Should we return if there is any space available instead?
+	if b.n == 0 {
+		return nil
+	}
+
+	b.nFlushing = b.n
+
+	if !blocking {
+		// Release the mutex to allow concurrent writes
+		// TODO Try to prevent live locking?
+		b.mtx.Unlock()
+	}
+
+	// Actually flush the first nFlush bytes
+	//		fmt.Printf(" needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
+	n, err := b.wr.Write(b.buf[0:b.nFlushing])
+	if n < b.nFlushing && err == nil {
+		err = io.ErrShortWrite
+	}
+	//		fmt.Printf(" n %v, err %v\n", n, err)
+
+	if !blocking {
+		// Grab back the mutex and update the state
+		b.mtx.Lock()
+	}
+
+	if n > 0 && n < b.n {
+		copy(b.buf[0:b.n-n], b.buf[n:b.n])
+	}
+	b.n -= n
+	b.err = err
+	//		fmt.Printf(" needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
+
+	// Done flushing.
+	b.nFlushing = 0
+	// Awake one goroutine waiting for flushing to complete.
+	b.cond.Signal()
+	//		fmt.Printf(" needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
+
+	return b.err
+}
+
+// Flush writes any buffered data to the underlying io.Writer.
+func (b *SafeWriter) flush2(needed int) error {
 	if b.err != nil {
 		return b.err
 	}
 	if b.n == 0 {
 		return nil
 	}
-	// Wait until enough space is available
-	for needed > b.available() {
-		if b.nFlushing != 0 {
-			// Flush in progress, wait and see
-			b.cond.Wait()
-			continue
-		}
-
-		b.nFlushing = b.n
-
-		// Release the mutex to allow concurrent writes
-		// TODO Avoid live locking?
-		b.mtx.Unlock()
-
-		// Actually flush the first nFlush bytes
-		n, err := b.wr.Write(b.buf[0:b.nFlushing])
-		n64 := int64(n)
-		if n64 < b.nFlushing && err == nil {
-			err = io.ErrShortWrite
-		}
-
-		// Grab back the mutex and update the state
-		b.mtx.Lock()
-
-		if n64 > 0 && n64 < b.n {
-			copy(b.buf[0:b.n-n64], b.buf[n64:b.n])
-		}
-		b.n -= n64
-		b.err = err
-
-		// Done flushing.
-		b.nFlushing = 0
-		// Awake one goroutine waiting for flushing to complete.
-		b.cond.Signal()
+	n, err := b.wr.Write(b.buf[0:b.n])
+	if n < b.n && err == nil {
+		err = io.ErrShortWrite
 	}
-	return b.err
+	if err != nil {
+		if n > 0 && n < b.n {
+			copy(b.buf[0:b.n-n], b.buf[n:b.n])
+		}
+		b.n -= n
+		b.err = err
+		return err
+	}
+	b.n = 0
+	return nil
 }
 
 // Available returns how many bytes are unused in the buffer.
-func (b *SafeWriter) Available() int { return len(b.buf) - int(atomic.LoadInt64(&b.n)) }
-
-func (b *SafeWriter) available() int { return len(b.buf) - int(b.n) }
+func (b *SafeWriter) Available() int {
+	b.mtx.Lock()
+	res := b.available()
+	b.mtx.Unlock()
+	return res
+}
+func (b *SafeWriter) available() int { return len(b.buf) - b.n }
 
 // Buffered returns the number of bytes that have been written into the current buffer.
-func (b *SafeWriter) Buffered() int { return int(atomic.LoadInt64(&b.n)) }
-
-func (b *SafeWriter) buffered() int { return int(b.n) }
+func (b *SafeWriter) Buffered() int {
+	b.mtx.Lock()
+	res := b.buffered()
+	b.mtx.Unlock()
+	return res
+}
+func (b *SafeWriter) buffered() int { return b.n }
 
 // Write writes the contents of p into the buffer.
 // It returns the number of bytes written.
@@ -149,8 +190,8 @@ func (b *SafeWriter) Write(p []byte) (nn int, err error) {
 			n, b.err = b.wr.Write(p)
 		} else {
 			n = copy(b.buf[b.n:], p)
-			b.n += int64(n)
-			b.flush(1)
+			b.n += n
+			b.flush(true)
 		}
 		nn += n
 		p = p[n:]
@@ -159,7 +200,7 @@ func (b *SafeWriter) Write(p []byte) (nn int, err error) {
 		return nn, b.err
 	}
 	n := copy(b.buf[b.n:], p)
-	b.n += int64(n)
+	b.n += n
 	nn += n
 	return nn, nil
 }
@@ -171,7 +212,7 @@ func (b *SafeWriter) WriteByte(c byte) error {
 	if b.err != nil {
 		return b.err
 	}
-	if b.available() <= 0 && b.flush(1) != nil {
+	if b.available() <= 0 && b.flush(false) != nil {
 		return b.err
 	}
 	b.buf[b.n] = c
@@ -194,13 +235,14 @@ func (b *SafeWriter) WriteRune(r rune) (size int, err error) {
 	if b.err != nil {
 		return 0, b.err
 	}
-	if b.available() < utf8.UTFMax {
-		if b.flush(utf8.UTFMax); b.err != nil {
+	// Keep flushing until enough space is available
+	for b.available() < utf8.UTFMax {
+		if b.flush(false); b.err != nil {
 			return 0, b.err
 		}
 	}
 	size = utf8.EncodeRune(b.buf[b.n:], r)
-	b.n += int64(size)
+	b.n += size
 	return size, nil
 }
 
@@ -214,16 +256,16 @@ func (b *SafeWriter) WriteString(s string) (int, error) {
 	nn := 0
 	for len(s) > b.available() && b.err == nil {
 		n := copy(b.buf[b.n:], s)
-		b.n += int64(n)
+		b.n += n
 		nn += n
 		s = s[n:]
-		b.flush(1)
+		b.flush(true)
 	}
 	if b.err != nil {
 		return nn, b.err
 	}
 	n := copy(b.buf[b.n:], s)
-	b.n += int64(n)
+	b.n += n
 	nn += n
 	return nn, nil
 }
@@ -240,7 +282,7 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 	var m int
 	for {
 		if b.available() == 0 {
-			if err1 := b.flush(1); err1 != nil {
+			if err1 := b.flush(true); err1 != nil {
 				return n, err1
 			}
 		}
@@ -255,7 +297,7 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 		if nr == maxConsecutiveEmptyReads {
 			return n, io.ErrNoProgress
 		}
-		b.n += int64(m)
+		b.n += m
 		n += int64(m)
 		if err != nil {
 			break
@@ -264,7 +306,7 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 	if err == io.EOF {
 		// If we filled the buffer exactly, flush preemptively.
 		if b.available() == 0 {
-			err = b.flush(1)
+			err = b.flush(false)
 		} else {
 			err = nil
 		}
