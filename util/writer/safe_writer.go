@@ -1,25 +1,22 @@
 package writer
 
 import (
-	//	"fmt"
 	"io"
 	"sync"
 	"unicode/utf8"
 )
 
-const (
-	defaultBufSize           = 4096
-	maxConsecutiveEmptyReads = 100
-)
+const defaultBufSize = 4096
+const maxConsecutiveEmptyReads = 100
 
 // SafeWriter implements highly concurrent buffering for an io.Writer object.
-//
 // In particular, writes will not block while a Flush() call is in progress as
-// long as more space is available in the buffer than the amount of data being
-// written. Note however that writes will still block in a number of cases,
-// e.g. when a Flush() vall is in progress and there is not enough available
-// space in the buffer or when another write larger than the buffer size is in
-// progress.
+// long as enough buffer space is available.
+//
+// Note however that writes will still block in a number of cases, e.g. when
+// another write, larger than the buffer size, is in progress. Also, concurrent
+// Flush() calls (whether explicit or triggered by the buffer filling up) will
+// block one another.
 type SafeWriter struct {
 	mtx  *sync.Mutex
 	cond *sync.Cond
@@ -29,8 +26,8 @@ type SafeWriter struct {
 	n   int
 	wr  io.Writer
 
-	// Number of bytes being flushed from the start of buf. Only non-zero when a
-	// flush is in progress, always <= n.
+	// Number of bytes currently being flushed from the start of buf. Only
+	// non-zero while a flush is in progress. Always <= n.
 	nFlushing int
 }
 
@@ -43,8 +40,11 @@ func NewSafeWriterSize(w io.Writer, size int) *SafeWriter {
 	if ok && len(b.buf) >= size {
 		return b
 	}
-	if size < utf8.UTFMax {
+	if size <= 0 {
 		size = defaultBufSize
+	}
+	if size < utf8.UTFMax {
+		size = utf8.UTFMax
 	}
 	m := new(sync.Mutex)
 	return &SafeWriter{
@@ -64,6 +64,14 @@ func NewSafeWriter(w io.Writer) *SafeWriter {
 // resets b to write its output to w.
 func (b *SafeWriter) Reset(w io.Writer) {
 	b.mtx.Lock()
+
+	// Wait for in-progress flush() calls to compete
+	for b.err == nil && b.nFlushing != 0 {
+		b.cond.Wait()
+	}
+	// (Potentially) wake one other goroutine waiting on flush()
+	b.cond.Signal()
+
 	b.err = nil
 	b.n = 0
 	b.wr = w
@@ -75,45 +83,72 @@ func (b *SafeWriter) Reset(w io.Writer) {
 // buffer has enough available space, writes can proceed concurrently.
 func (b *SafeWriter) Flush() error {
 	b.mtx.Lock()
-	defer b.mtx.Unlock()
-	return b.flush(false)
+	err := b.flush(NON_BLOCKING, EXPECT_FLUSH)
+	b.mtx.Unlock()
+	return err
 }
 
-func (b *SafeWriter) flush(blocking bool) error {
-	//	fmt.Printf("needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
+// Whether flush() should prevent concurrent writes or not.
+type flushConcurrency int
+
+// Whether the flush() caller expects a fully empty buffer or only some space.
+type flushExpectation int
+
+const (
+	// Do not allow concurrent writes while flushing. Needed while large writes
+	// (larger than available buffer size) are in progress.
+	//
+	// In practice, when large writes are in progress the buffer will always be
+	// full while the mutex is unlocked inside flush() (i.e. b.n == b.nFlushing
+	// == len(buf)) so this is not necessary IF callers are well behaved. But even
+	// so it is more efficient to not unnecessarily wake a goroutine wating for
+	// free buffer space.
+	BLOCKING flushConcurrency = iota
+	// Allow concurrent writes while flushing.
+	NON_BLOCKING
+	// The caller expects any data in the buffer to actually be flushed.
+	EXPECT_FLUSH flushExpectation = iota
+	// The caller expects some space to become available in the buffer, is not
+	// interested in actually flushing any buffered data. Useful for preventing
+	// unnecessarily flushing small amounts of data when an in-progress flush
+	// already freed up buffer space.
+	EXPECT_SPACE
+)
+
+func (b *SafeWriter) flush(concurrency flushConcurrency, expect flushExpectation) error {
+	// Always (potentially) wake one goroutine waiting on flush()
+	defer b.cond.Signal()
+
+	// Wait for in-progress flush() calls to complete
+	for b.err == nil && b.nFlushing != 0 {
+		b.cond.Wait()
+		if expect == EXPECT_SPACE && b.available() > 0 {
+			return b.err
+		}
+	}
 	if b.err != nil {
 		return b.err
 	}
-
-	// Wait while another flush in progress
-	for b.err == nil && b.nFlushing != 0 {
-		b.cond.Wait()
-		//	fmt.Printf(" w needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
-		continue
-	}
-	// TODO Should we return if there is any space available instead?
-	if b.n == 0 {
+	// Return if caller expectation has been met.
+	if (expect == EXPECT_FLUSH && b.n == 0) || (expect == EXPECT_SPACE && b.available() > 0) {
 		return nil
 	}
 
 	b.nFlushing = b.n
 
-	if !blocking {
+	if concurrency == NON_BLOCKING && b.nFlushing != len(b.buf) {
 		// Release the mutex to allow concurrent writes
-		// TODO Try to prevent live locking?
 		b.mtx.Unlock()
 	}
 
 	// Actually flush the first nFlush bytes
-	//		fmt.Printf(" needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
 	n, err := b.wr.Write(b.buf[0:b.nFlushing])
 	if n < b.nFlushing && err == nil {
 		err = io.ErrShortWrite
 	}
-	//		fmt.Printf(" n %v, err %v\n", n, err)
 
-	if !blocking {
-		// Grab back the mutex and update the state
+	if concurrency == NON_BLOCKING && b.nFlushing != len(b.buf) {
+		// Grab back the mutex once the potentially blocking I/O calls are done
 		b.mtx.Lock()
 	}
 
@@ -122,19 +157,13 @@ func (b *SafeWriter) flush(blocking bool) error {
 	}
 	b.n -= n
 	b.err = err
-	//		fmt.Printf(" needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
-
-	// Done flushing.
 	b.nFlushing = 0
-	// Awake one goroutine waiting for flushing to complete.
-	b.cond.Signal()
-	//		fmt.Printf(" needed %v, b.available() %v, b.n %v, b.nFlushing %v, b.err %v\n", needed, b.available(), b.n, b.nFlushing, b.err)
 
 	return b.err
 }
 
 // Flush writes any buffered data to the underlying io.Writer.
-func (b *SafeWriter) flush2(needed int) error {
+func (b *SafeWriter) flush2(concurrency flushConcurrency, expect flushExpectation) error {
 	if b.err != nil {
 		return b.err
 	}
@@ -189,9 +218,10 @@ func (b *SafeWriter) Write(p []byte) (nn int, err error) {
 			// Write directly from p to avoid copy.
 			n, b.err = b.wr.Write(p)
 		} else {
+			//			n = len(p) / (len(p) - len(p))
 			n = copy(b.buf[b.n:], p)
 			b.n += n
-			b.flush(true)
+			b.flush(BLOCKING, EXPECT_SPACE)
 		}
 		nn += n
 		p = p[n:]
@@ -212,7 +242,7 @@ func (b *SafeWriter) WriteByte(c byte) error {
 	if b.err != nil {
 		return b.err
 	}
-	if b.available() <= 0 && b.flush(false) != nil {
+	if b.available() <= 0 && b.flush(NON_BLOCKING, EXPECT_SPACE) != nil {
 		return b.err
 	}
 	b.buf[b.n] = c
@@ -237,7 +267,7 @@ func (b *SafeWriter) WriteRune(r rune) (size int, err error) {
 	}
 	// Keep flushing until enough space is available
 	for b.available() < utf8.UTFMax {
-		if b.flush(false); b.err != nil {
+		if b.flush(NON_BLOCKING, EXPECT_SPACE); b.err != nil {
 			return 0, b.err
 		}
 	}
@@ -259,7 +289,7 @@ func (b *SafeWriter) WriteString(s string) (int, error) {
 		b.n += n
 		nn += n
 		s = s[n:]
-		b.flush(true)
+		b.flush(BLOCKING, EXPECT_SPACE)
 	}
 	if b.err != nil {
 		return nn, b.err
@@ -282,7 +312,7 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 	var m int
 	for {
 		if b.available() == 0 {
-			if err1 := b.flush(true); err1 != nil {
+			if err1 := b.flush(BLOCKING, EXPECT_SPACE); err1 != nil {
 				return n, err1
 			}
 		}
@@ -306,7 +336,7 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 	if err == io.EOF {
 		// If we filled the buffer exactly, flush preemptively.
 		if b.available() == 0 {
-			err = b.flush(false)
+			err = b.flush(NON_BLOCKING, EXPECT_SPACE)
 		} else {
 			err = nil
 		}

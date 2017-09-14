@@ -6,14 +6,142 @@ import (
 	"io"
 	"io/ioutil"
 	"strings"
+	"sync"
 	"testing"
 	"testing/iotest"
-	//	. "github.com/prometheus/prometheus/util/writer"
 )
 
 var bufsizes = []int{
-	0, 16, 23, 32, 46, 64, 93, 128, 1024, 4096,
+	//	0, 16, 23, 32, // 46, 64, 93, 128, 1024, 4096,
+	0, 7, 16,
 }
+
+func TestConcurrentWrites(t *testing.T) {
+	var data [8192]byte
+
+	for i := 0; i < len(data); i++ {
+		data[i] = byte(' ' + i%('~'-' '))
+	}
+	w := new(bytes.Buffer)
+	for i := 0; i < len(bufsizes); i++ {
+		for j := 0; j < len(bufsizes); j++ {
+			nwrite := bufsizes[i]
+			bs := bufsizes[j]
+
+			// Write nwrite bytes using buffer size bs from each of 100 goroutines.
+			// Check that the right amount makes it out and that the data is correct.
+
+			w.Reset()
+			buf := NewSafeWriterSize(w, bs)
+			context := fmt.Sprintf("nwrite=%d bufsize=%d", nwrite, bs)
+
+			var wg sync.WaitGroup
+			nroutines := 100
+			wg.Add(nroutines)
+			for k := 0; k < nroutines; k++ {
+				go func(index int) {
+					defer wg.Done()
+					n, e1 := buf.Write(data[0:nwrite])
+					if e1 != nil || n != nwrite {
+						t.Errorf("%s: buf.Write %d = %d, %v", context, nwrite, n, e1)
+						return
+					}
+					// Liberally sprinkle some Flush() calls
+					if index%3 == 0 {
+						if e := buf.Flush(); e != nil {
+							t.Errorf("%s: buf.Flush = %v", context, e)
+						}
+					}
+				}(k)
+			}
+			wg.Wait()
+			buf.Flush()
+
+			written := w.Bytes()
+			if len(written) != nwrite*nroutines {
+				t.Errorf("%s: %d bytes written", context, len(written))
+			}
+			for l := 0; l < len(written); l++ {
+				if written[l] != data[l%nwrite] {
+					t.Errorf("%s: wrong bytes written @%d", context, l)
+					t.Errorf("  want %d * %q", nroutines, data[0:nwrite])
+					t.Fatalf("  have=%q", written)
+				}
+			}
+		}
+	}
+}
+
+// A waitGroupBuffer is like bytes.Buffer, but the first Write() will block
+// on a sync.WaitGroup. It counts the number of times Write is called on it.
+type waitGroupBuffer struct {
+	buf bytes.Buffer
+	//	wg  *sync.WaitGroup
+	//	mtx *sync.Mutex
+	n        int
+	callback func()
+}
+
+func (w *waitGroupBuffer) Write(p []byte) (int, error) {
+	w.n++
+	if w.callback != nil {
+		w.callback()
+		w.callback = nil
+	}
+	return w.buf.Write(p)
+}
+
+//func TestFlushDoesNotBlockWrite(t *testing.T) {
+//	var data [10]byte
+//	for i := 0; i < len(data); i++ {
+//		data[i] = byte('0' + i)
+//	}
+//
+//	w := new(waitGroupBuffer)
+//	buf := NewSafeWriterSize(w, 1024)
+//
+//	buf.Write(data[:])
+//
+//	nroutines := 100
+//	var isFlushing, writesDone sync.WaitGroup
+//	isFlushing.Add(1)
+//	writesDone.Add(nroutines)
+//	for i := 0; i < nroutines; i++ {
+//		go func(index int) {
+//			isFlushing.Wait()
+//			buf.Write(data[:])
+//			writesDone.Done()
+//		}(i)
+//	}
+//
+//	w.callback = func() {
+//		// Flush() is in progress, unblock writer goroutines
+//		isFlushing.Done()
+//		// And wait for them to complete before allowing the flush to complete
+//		writesDone.Wait()
+//	}
+//
+//	if w.n != 0 {
+//		t.Errorf("Want 0 writes, got %d", w.n)
+//	}
+//	buf.Flush()
+//	if w.n != 1 {
+//		t.Errorf("Want 1 writes, got %d", w.n)
+//	}
+//	buf.Flush()
+//
+//	written := w.buf.Bytes()
+//	if len(written) != len(data)*(nroutines+1) {
+//		t.Errorf("%d bytes written", len(written))
+//	}
+//	for l := 0; l < len(written); l++ {
+//		if written[l] != data[l%len(data)] {
+//			t.Errorf("wrong bytes written")
+//			t.Errorf("want %d * %q", nroutines+1, data)
+//			t.Fatalf("have=%q", written)
+//		}
+//	}
+//}
 
 func TestWriter(t *testing.T) {
 	var data [8192]byte
@@ -48,7 +176,7 @@ func TestWriter(t *testing.T) {
 				t.Errorf("%s: %d bytes written", context, len(written))
 			}
 			for l := 0; l < len(written); l++ {
-				if written[i] != data[i] {
+				if written[l] != data[l] {
 					t.Errorf("wrong bytes written")
 					t.Errorf("want=%q", data[0:len(written)])
 					t.Errorf("have=%q", written)
@@ -376,23 +504,6 @@ type onlyWriter struct {
 	io.Writer
 }
 
-// A scriptedReader is an io.Reader that executes its steps sequentially.
-type scriptedReader []func(p []byte) (n int, err error)
-
-func (sr *scriptedReader) Read(p []byte) (n int, err error) {
-	if len(*sr) == 0 {
-		panic("too many Read calls on scripted Reader. No steps remain.")
-	}
-	step := (*sr)[0]
-	*sr = (*sr)[1:]
-	return step(p)
-}
-
-func newScriptedReader(steps ...func(p []byte) (n int, err error)) io.Reader {
-	sr := scriptedReader(steps)
-	return &sr
-}
-
 func BenchmarkWriterCopyOptimal(b *testing.B) {
 	// Optimal case is where the underlying writer implements io.ReaderFrom
 	srcBuf := bytes.NewBuffer(make([]byte, 8192))
@@ -460,4 +571,42 @@ func BenchmarkWriterFlush(b *testing.B) {
 		bw.WriteString(str)
 		bw.Flush()
 	}
+}
+
+func BenchmarkLargeConcurrentWrite(b *testing.B) {
+	b.ReportAllocs()
+	bw := NewSafeWriterSize(ioutil.Discard, 1024)
+	str := strings.Repeat("x", 12345)
+
+	var wg sync.WaitGroup
+	wg.Add(b.N)
+	for i := 0; i < b.N; i++ {
+		go func(index int) {
+			bw.WriteString(str)
+			if index%3 == 0 {
+				bw.Flush()
+			}
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+}
+
+func BenchmarkSmallConcurrentWrite(b *testing.B) {
+	b.ReportAllocs()
+	bw := NewSafeWriterSize(ioutil.Discard, 1024)
+	str := strings.Repeat("x", 123)
+
+	var wg sync.WaitGroup
+	wg.Add(b.N)
+	for i := 0; i < b.N; i++ {
+		go func(index int) {
+			bw.WriteString(str)
+			if index%33 == 0 {
+				bw.Flush()
+			}
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
 }
