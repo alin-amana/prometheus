@@ -107,7 +107,7 @@ func NewSafeWriter(w io.Writer) *SafeWriter {
 func (b *SafeWriter) Reset(w io.Writer) {
 	b.mtx.Lock()
 
-	// Wait for in-progress flush() calls to compete
+	// Wait for in-progress flush() call(s) to complete
 	for b.err == nil && b.nFlushing != 0 {
 		b.nonBlocking.Wait()
 	}
@@ -213,7 +213,7 @@ func (b *SafeWriter) beginBlockingWrite() int {
 func (b *SafeWriter) endBlockingWrite(ignored int) {
 	b.mode = NON_BLOCKING
 	// Wake all goroutines waiting to write
-	b.blocking.Broadcast()
+	b.blocking.Signal()
 }
 
 func (b *SafeWriter) waitIfBlockingWriteInFlight() {
@@ -221,6 +221,7 @@ func (b *SafeWriter) waitIfBlockingWriteInFlight() {
 	for b.mode == BLOCKING {
 		b.blocking.Wait()
 	}
+	b.blocking.Signal()
 }
 
 // Available returns how many bytes are unused in the buffer.
