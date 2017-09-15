@@ -12,8 +12,8 @@ import (
 )
 
 var bufsizes = []int{
-	//	0, 16, 23, 32, // 46, 64, 93, 128, 1024, 4096,
-	0, 7, 16,
+	0, 16, 23, 32, 46, 64, 93, 128, 1024, 4096,
+	//	0, 7, 16,
 }
 
 func TestConcurrentWrites(t *testing.T) {
