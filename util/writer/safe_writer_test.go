@@ -9,24 +9,33 @@ import (
 	"sync"
 	"testing"
 	"testing/iotest"
+	"unicode/utf8"
 )
 
 var bufsizes = []int{
-	0, 16, 23, 32, 46, 64, 93, 128, 1024, 4096,
-	//	0, 7, 16,
+	//	0, 16, 23, 32, 46, 64, 93, 128, 1024, 4096,
+	0, 7, 16,
 }
 
 func TestConcurrentWrites(t *testing.T) {
 	var data [8192]byte
+	runedata := '\U0010FFFF'
+	bdata := byte('X')
 
 	for i := 0; i < len(data); i++ {
 		data[i] = byte(' ' + i%('~'-' '))
 	}
+	stringdata := string(data[:])
+
+	var runebytes [4]byte
+	utf8.EncodeRune(runebytes[:], runedata)
+
 	w := new(bytes.Buffer)
 	for i := 0; i < len(bufsizes); i++ {
 		for j := 0; j < len(bufsizes); j++ {
 			nwrite := bufsizes[i]
 			bs := bufsizes[j]
+			sdata := stringdata[:nwrite]
 
 			// Write nwrite bytes using buffer size bs from each of 100 goroutines.
 			// Check that the right amount makes it out and that the data is correct.
@@ -41,13 +50,43 @@ func TestConcurrentWrites(t *testing.T) {
 			for k := 0; k < nroutines; k++ {
 				go func(index int) {
 					defer wg.Done()
-					n, e1 := buf.Write(data[0:nwrite])
-					if e1 != nil || n != nwrite {
-						t.Errorf("%s: buf.Write %d = %d, %v", context, nwrite, n, e1)
-						return
+
+					switch index % 5 {
+					case 0:
+						n, e1 := buf.Write(data[0:nwrite])
+						if e1 != nil || n != nwrite {
+							t.Errorf("%s: buf.Write %d = %d, %v", context, nwrite, n, e1)
+							return
+						}
+					case 1:
+						n, e1 := buf.WriteString(sdata)
+						if e1 != nil || n != nwrite {
+							t.Errorf("%s: buf.WriteString %d = %d, %v", context, nwrite, n, e1)
+							return
+						}
+					case 2:
+						r := bytes.NewReader(data[0:nwrite])
+						n, e1 := buf.ReadFrom(r)
+						if e1 != nil || n != int64(nwrite) {
+							t.Errorf("%s: buf.ReadFrom %d = %d, %v", context, nwrite, n, e1)
+							return
+						}
+					case 3:
+						n, e1 := buf.WriteRune(runedata)
+						if e1 != nil || n != 4 {
+							t.Errorf("%s: buf.WriteRune = %d, %v", context, n, e1)
+							return
+						}
+					case 4:
+						e1 := buf.WriteByte(bdata)
+						if e1 != nil {
+							t.Errorf("%s: buf.WriteByte %v", context, e1)
+							return
+						}
 					}
+
 					// Liberally sprinkle some Flush() calls
-					if index%3 == 0 {
+					if index%7 == 0 {
 						if e := buf.Flush(); e != nil {
 							t.Errorf("%s: buf.Flush = %v", context, e)
 						}
@@ -58,31 +97,50 @@ func TestConcurrentWrites(t *testing.T) {
 			buf.Flush()
 
 			written := w.Bytes()
-			if len(written) != nwrite*nroutines {
-				t.Errorf("%s: %d bytes written", context, len(written))
+			expected := nroutines / 5 * (3*nwrite + 4 + 1)
+			if len(written) != expected {
+				t.Errorf("%s: %d bytes expected, %d written", context, expected, len(written))
 			}
 			for l := 0; l < len(written); l++ {
-				if written[l] != data[l%nwrite] {
-					t.Errorf("%s: wrong bytes written @%d", context, l)
-					t.Errorf("  want %d * %q", nroutines, data[0:nwrite])
-					t.Fatalf("  have=%q", written)
+				var expData []byte
+				switch written[l] {
+				case data[0]:
+					expData = data[:nwrite]
+					//fmt.Printf("bytes @%d: %q\n", l, written[l])
+				case runebytes[0]:
+					expData = runebytes[:]
+					//fmt.Printf("rune @%d: %q\n", l, written[l])
+				case bdata:
+					expData = []byte{bdata}
+					//fmt.Printf("byte @%d: %q\n", l, written[l])
+				default:
+					t.Errorf("%s: unexpected byte written @%d: %q expected: %q", context, l, written[l])
 				}
+				//fmt.Printf("%s %d/%d, %q, %q, %q\n", context, l, len(written), expData, written[l], expData[0])
+				for ll := 0; ll < len(expData); ll++ {
+					//					fmt.Printf(">%s %d/%d/%d, %q, %q, %q\n", context, l, len(expData), len(written), expData, written[l], expData[ll])
+					if written[l] != expData[ll] {
+						t.Errorf("%s: wrong bytes written @%d: %q expected: %q", context, l, written[l], expData[ll])
+						t.Errorf("  want %d * %q, %d * %+q, %d * %q", 3*nroutines/5, data[0:nwrite], nroutines/5, runedata, nroutines/5, bdata)
+						t.Fatalf("  have=%q", written)
+					}
+					l++
+				}
+				l--
 			}
 		}
 	}
 }
 
-// A waitGroupBuffer is like bytes.Buffer, but the first Write() will block
-// on a sync.WaitGroup. It counts the number of times Write is called on it.
-type waitGroupBuffer struct {
-	buf bytes.Buffer
-	//	wg  *sync.WaitGroup
-	//	mtx *sync.Mutex
+// A callbackBuffer is like bytes.Buffer, but Write() will invoke the given
+// callback then reset it. It counts the number of times Write is called on it.
+type callbackBuffer struct {
+	buf      bytes.Buffer
 	n        int
 	callback func()
 }
 
-func (w *waitGroupBuffer) Write(p []byte) (int, error) {
+func (w *callbackBuffer) Write(p []byte) (int, error) {
 	w.n++
 	if w.callback != nil {
 		w.callback()
@@ -91,57 +149,68 @@ func (w *waitGroupBuffer) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
-//func TestFlushDoesNotBlockWrite(t *testing.T) {
-//	var data [10]byte
-//	for i := 0; i < len(data); i++ {
-//		data[i] = byte('0' + i)
-//	}
-//
-//	w := new(waitGroupBuffer)
-//	buf := NewSafeWriterSize(w, 1024)
-//
-//	buf.Write(data[:])
-//
-//	nroutines := 100
-//	var isFlushing, writesDone sync.WaitGroup
-//	isFlushing.Add(1)
-//	writesDone.Add(nroutines)
-//	for i := 0; i < nroutines; i++ {
-//		go func(index int) {
-//			isFlushing.Wait()
-//			buf.Write(data[:])
-//			writesDone.Done()
-//		}(i)
-//	}
-//
-//	w.callback = func() {
-//		// Flush() is in progress, unblock writer goroutines
-//		isFlushing.Done()
-//		// And wait for them to complete before allowing the flush to complete
-//		writesDone.Wait()
-//	}
-//
-//	if w.n != 0 {
-//		t.Errorf("Want 0 writes, got %d", w.n)
-//	}
-//	buf.Flush()
-//	if w.n != 1 {
-//		t.Errorf("Want 1 writes, got %d", w.n)
-//	}
-//	buf.Flush()
-//
-//	written := w.buf.Bytes()
-//	if len(written) != len(data)*(nroutines+1) {
-//		t.Errorf("%d bytes written", len(written))
-//	}
-//	for l := 0; l < len(written); l++ {
-//		if written[l] != data[l%len(data)] {
-//			t.Errorf("wrong bytes written")
-//			t.Errorf("want %d * %q", nroutines+1, data)
-//			t.Fatalf("have=%q", written)
-//		}
-//	}
-//}
+func TestFlushDoesNotBlockWrite(t *testing.T) {
+	var data [10]byte
+	for i := 0; i < len(data); i++ {
+		data[i] = byte('0' + i)
+	}
+
+	w := new(callbackBuffer)
+	buf := NewSafeWriterSize(w, 1024)
+
+	nroutines := 100
+	var isFlushing, writesDone sync.WaitGroup
+	isFlushing.Add(1)
+	writesDone.Add(nroutines)
+	for i := 0; i < nroutines; i++ {
+		go func(index int) {
+			isFlushing.Wait()
+			buf.Write(data[:])
+			writesDone.Done()
+		}(i)
+	}
+
+	w.callback = func() {
+		// Flush() is in progress, unblock writer goroutines
+		isFlushing.Done()
+		// And wait for all writes to complete before allowing the flush to continue
+		writesDone.Wait()
+	}
+
+	checkNWrites := func(n int) {
+		if w.n != n {
+			t.Errorf("Want %d writes, got %d", n, w.n)
+		}
+	}
+
+	// Write some data to buf, check that no write made it through to w
+	buf.Write(data[:])
+	checkNWrites(0)
+
+	// Explicitly flush, check that it made it through
+	buf.Flush()
+	checkNWrites(1)
+
+	// Write goroutines have all completed by now, flush and check it went through
+	buf.Flush()
+	checkNWrites(2)
+
+	// No other writes, Flush() should be a noop
+	buf.Flush()
+	checkNWrites(2)
+
+	written := w.buf.Bytes()
+	if len(written) != len(data)*(nroutines+1) {
+		t.Errorf("%d bytes written", len(written))
+	}
+	for l := 0; l < len(written); l++ {
+		if written[l] != data[l%len(data)] {
+			t.Errorf("wrong bytes written")
+			t.Errorf("want %d * %q", nroutines+1, data)
+			t.Fatalf("have=%q", written)
+		}
+	}
+}
 
 func TestWriter(t *testing.T) {
 	var data [8192]byte

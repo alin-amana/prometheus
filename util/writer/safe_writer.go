@@ -1,6 +1,7 @@
 package writer
 
 import (
+	//	"fmt"
 	"io"
 	"sync"
 	"unicode/utf8"
@@ -63,12 +64,12 @@ type SafeWriter struct {
 	// Number of bytes currently being flushed from the start of buf. Only
 	// non-zero while a flush is in progress. Always <= n.
 	nFlushing int
+	// Condition variable for all goroutines waiting for flush()
+	flushing *sync.Cond
 	// true if a blocking write is waiting, false otherwise
 	mode writerMode
-	// Condition variable for the one blocking write in progress
+	// Condition variable for all goroutines waiting on a blocking write
 	blocking *sync.Cond
-	// Condition variable for all non-blocking writes
-	nonBlocking *sync.Cond
 }
 
 // NewSafeWriterSize returns a new SafeWriter whose buffer has at least the
@@ -88,12 +89,12 @@ func NewSafeWriterSize(w io.Writer, size int) *SafeWriter {
 	}
 	m := new(sync.Mutex)
 	return &SafeWriter{
-		mtx:         m,
-		buf:         make([]byte, size),
-		wr:          w,
-		mode:        NON_BLOCKING,
-		blocking:    sync.NewCond(m),
-		nonBlocking: sync.NewCond(m),
+		mtx:      m,
+		buf:      make([]byte, size),
+		wr:       w,
+		flushing: sync.NewCond(m),
+		mode:     NON_BLOCKING,
+		blocking: sync.NewCond(m),
 	}
 }
 
@@ -109,10 +110,10 @@ func (b *SafeWriter) Reset(w io.Writer) {
 
 	// Wait for in-progress flush() call(s) to complete
 	for b.err == nil && b.nFlushing != 0 {
-		b.nonBlocking.Wait()
+		b.flushing.Wait()
 	}
 	// (Potentially) wake one other goroutine waiting on flush()
-	b.nonBlocking.Signal()
+	b.flushing.Signal()
 
 	b.err = nil
 	b.n = 0
@@ -135,7 +136,7 @@ func (b *SafeWriter) Flush() error {
 
 func (b *SafeWriter) flush(expect flushExpectation) error {
 	// Always (potentially) wake one goroutine waiting on flush()
-	defer b.nonBlocking.Signal()
+	defer b.flushing.Signal()
 
 	if b.err != nil {
 		return b.err
@@ -143,7 +144,7 @@ func (b *SafeWriter) flush(expect flushExpectation) error {
 
 	// Wait for any in-progress flush() to complete
 	for b.nFlushing != 0 {
-		b.nonBlocking.Wait()
+		b.flushing.Wait()
 	}
 
 	// Return if caller expectation has been met.
@@ -306,23 +307,27 @@ func (b *SafeWriter) WriteRune(r rune) (size int, err error) {
 		return 1, nil
 	}
 
-	b.mtx.Lock()
-	defer b.mtx.Unlock()
+	var encoded [4]byte
+	size = utf8.EncodeRune(encoded[:], r)
+	return b.Write(encoded[:size])
 
-	if b.err != nil {
-		return 0, b.err
-	}
-	b.waitIfBlockingWriteInFlight()
-
-	// Keep flushing until enough space is available
-	for b.available() < utf8.UTFMax {
-		if b.flush(EXPECT_SPACE); b.err != nil {
-			return 0, b.err
-		}
-	}
-	size = utf8.EncodeRune(b.buf[b.n:], r)
-	b.n += size
-	return size, nil
+	//	b.mtx.Lock()
+	//	defer b.mtx.Unlock()
+	//
+	//	if b.err != nil {
+	//		return 0, b.err
+	//	}
+	//	b.waitIfBlockingWriteInFlight()
+	//
+	//	if b.available() < utf8.UTFMax {
+	//		// Actually flush the buffer if there are less than 4 bytes available
+	//		if b.flush(EXPECT_FLUSH); b.err != nil {
+	//			return 0, b.err
+	//		}
+	//	}
+	//	size = utf8.EncodeRune(b.buf[b.n:], r)
+	//	b.n += size
+	//	return size, nil
 }
 
 // WriteString writes a string.
@@ -340,6 +345,7 @@ func (b *SafeWriter) WriteString(s string) (int, error) {
 	b.waitIfBlockingWriteInFlight()
 
 	for len(s) > b.available() {
+		//		fmt.Printf("s = \"%s\" available = %d\n", s, b.available())
 		n := copy(b.buf[b.n:], s)
 		b.n += n
 		nn += n
@@ -353,6 +359,7 @@ func (b *SafeWriter) WriteString(s string) (int, error) {
 			return nn, b.err
 		}
 	}
+	//	fmt.Printf("s = \"%s\" available = %d\n", s, b.available())
 	n := copy(b.buf[b.n:], s)
 	b.n += n
 	nn += n
