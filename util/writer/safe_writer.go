@@ -9,6 +9,28 @@ import (
 const defaultBufSize = 4096
 const maxConsecutiveEmptyReads = 100
 
+// Whether flush() should prevent concurrent writes or not.
+type flushConcurrency int
+
+// Whether the flush() caller expects a fully empty buffer or only some space.
+type flushExpectation int
+
+const (
+	// Do not allow concurrent writes while flushing. Needed while chunked writes
+	// (larger than the initially available buffer size) are in progress.
+	BLOCKING flushConcurrency = iota
+	// Allow concurrent writes while flushing. In particular, if caller is a
+	// Write() function, it has finished writing and other writes may proceed.
+	NON_BLOCKING
+	// The caller expects all data currently in the buffer to actually be flushed.
+	EXPECT_FLUSH flushExpectation = iota
+	// The caller expects some space to become available in the buffer, it is not
+	// interested in actually flushing all buffered data. Useful for preventing
+	// unnecessarily flushing small amounts of data when an in-progress flush
+	// will free up buffer space.
+	EXPECT_SPACE
+)
+
 // SafeWriter implements highly concurrent buffering for an io.Writer object.
 // In particular, writes will not block while a Flush() call is in progress as
 // long as enough buffer space is available.
@@ -18,17 +40,34 @@ const maxConsecutiveEmptyReads = 100
 // Flush() calls (whether explicit or triggered by the buffer filling up) will
 // block one another.
 type SafeWriter struct {
-	mtx  *sync.Mutex
-	cond *sync.Cond
+	// Protects all fields
+	mtx *sync.Mutex
 
 	err error
 	buf []byte
 	n   int
 	wr  io.Writer
 
+	// Fields below are only used by flush() (and marginally by Reset()) to
+	// provide correct serialization of writes.
+	//
+	// When a blocking write calls flush() and finds a concurrent flush already
+	// in progress, it sets the blockingWaiting flag and calls blocking.Wait().
+	// When a non-blocking write calls flush() and finds that either (1) a
+	// concurrent flush already in progress; or (2) blockingWaiting == true; it
+	// calls non_blocking.Wait().
+	// When a flush() call terminates it calls blocking.Signal() iff
+	// blockingWaiting == true; or nonBlocking.Signal() otherwise.
+
 	// Number of bytes currently being flushed from the start of buf. Only
 	// non-zero while a flush is in progress. Always <= n.
 	nFlushing int
+	// true if a blocking write is waiting, false otherwise
+	blockingWaiting bool
+	// Condition variable for the one blocking write in progress
+	blocking *sync.Cond
+	// Condition variable for non-blocking writes
+	nonBlocking *sync.Cond
 }
 
 // NewSafeWriterSize returns a new SafeWriter whose buffer has at least the
@@ -48,10 +87,11 @@ func NewSafeWriterSize(w io.Writer, size int) *SafeWriter {
 	}
 	m := new(sync.Mutex)
 	return &SafeWriter{
-		mtx:  m,
-		cond: sync.NewCond(m),
-		buf:  make([]byte, size),
-		wr:   w,
+		mtx:         m,
+		buf:         make([]byte, size),
+		wr:          w,
+		blocking:    sync.NewCond(m),
+		nonBlocking: sync.NewCond(m),
 	}
 }
 
@@ -67,10 +107,10 @@ func (b *SafeWriter) Reset(w io.Writer) {
 
 	// Wait for in-progress flush() calls to compete
 	for b.err == nil && b.nFlushing != 0 {
-		b.cond.Wait()
+		b.nonBlocking.Wait()
 	}
 	// (Potentially) wake one other goroutine waiting on flush()
-	b.cond.Signal()
+	b.nonBlocking.Signal()
 
 	b.err = nil
 	b.n = 0
@@ -88,47 +128,40 @@ func (b *SafeWriter) Flush() error {
 	return err
 }
 
-// Whether flush() should prevent concurrent writes or not.
-type flushConcurrency int
-
-// Whether the flush() caller expects a fully empty buffer or only some space.
-type flushExpectation int
-
-const (
-	// Do not allow concurrent writes while flushing. Needed while large writes
-	// (larger than available buffer size) are in progress.
-	//
-	// In practice, when large writes are in progress the buffer will always be
-	// full while the mutex is unlocked inside flush() (i.e. b.n == b.nFlushing
-	// == len(buf)) so this is not necessary IF callers are well behaved. But even
-	// so it is more efficient to not unnecessarily wake a goroutine wating for
-	// free buffer space.
-	BLOCKING flushConcurrency = iota
-	// Allow concurrent writes while flushing.
-	NON_BLOCKING
-	// The caller expects any data in the buffer to actually be flushed.
-	EXPECT_FLUSH flushExpectation = iota
-	// The caller expects some space to become available in the buffer, is not
-	// interested in actually flushing any buffered data. Useful for preventing
-	// unnecessarily flushing small amounts of data when an in-progress flush
-	// already freed up buffer space.
-	EXPECT_SPACE
-)
-
 func (b *SafeWriter) flush(concurrency flushConcurrency, expect flushExpectation) error {
 	// Always (potentially) wake one goroutine waiting on flush()
-	defer b.cond.Signal()
-
-	// Wait for in-progress flush() calls to complete
-	for b.err == nil && b.nFlushing != 0 {
-		b.cond.Wait()
-		if expect == EXPECT_SPACE && b.available() > 0 {
-			return b.err
+	defer func() {
+		if b.blockingWaiting {
+			b.blocking.Signal()
+		} else {
+			b.nonBlocking.Signal()
 		}
-	}
+	}()
+
 	if b.err != nil {
 		return b.err
 	}
+
+	if concurrency == BLOCKING {
+		if b.blockingWaiting {
+			panic("Concurrent blocking writes, this did not just happen.")
+		}
+
+		if b.nFlushing != 0 {
+			// We're a blocking write, set the blockingWaiting flag and wait
+			b.blockingWaiting = true
+			defer func() { b.blockingWaiting = false }()
+			for b.nFlushing != 0 {
+				b.blocking.Wait()
+			}
+		}
+	} else {
+		// Non-blocking write, wait for in-progress flush() calls or blocking writes
+		for b.nFlushing != 0 || b.blockingWaiting {
+			b.nonBlocking.Wait()
+		}
+	}
+
 	// Return if caller expectation has been met.
 	if (expect == EXPECT_FLUSH && b.n == 0) || (expect == EXPECT_SPACE && b.available() > 0) {
 		return nil
@@ -209,6 +242,7 @@ func (b *SafeWriter) buffered() int { return b.n }
 // If nn < len(p), it also returns an error explaining
 // why the write is short.
 func (b *SafeWriter) Write(p []byte) (nn int, err error) {
+	concurrency := NON_BLOCKING
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
 	for len(p) > b.available() && b.err == nil {
@@ -218,10 +252,11 @@ func (b *SafeWriter) Write(p []byte) (nn int, err error) {
 			// Write directly from p to avoid copy.
 			n, b.err = b.wr.Write(p)
 		} else {
-			//			n = len(p) / (len(p) - len(p))
+			// Start blocking concurrent writes as soon as we do a partial write
+			concurrency = BLOCKING
 			n = copy(b.buf[b.n:], p)
 			b.n += n
-			b.flush(BLOCKING, EXPECT_SPACE)
+			b.flush(concurrency, EXPECT_SPACE)
 		}
 		nn += n
 		p = p[n:]
@@ -281,15 +316,20 @@ func (b *SafeWriter) WriteRune(r rune) (size int, err error) {
 // If the count is less than len(s), it also returns an error explaining
 // why the write is short.
 func (b *SafeWriter) WriteString(s string) (int, error) {
+	concurrency := NON_BLOCKING
+	nn := 0
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
-	nn := 0
 	for len(s) > b.available() && b.err == nil {
 		n := copy(b.buf[b.n:], s)
 		b.n += n
 		nn += n
 		s = s[n:]
-		b.flush(BLOCKING, EXPECT_SPACE)
+		if len(s) > 0 {
+			// Start blocking concurrent writes as soon as we started a partial write
+			concurrency = BLOCKING
+		}
+		b.flush(concurrency, EXPECT_SPACE)
 	}
 	if b.err != nil {
 		return nn, b.err
@@ -302,6 +342,7 @@ func (b *SafeWriter) WriteString(s string) (int, error) {
 
 // ReadFrom implements io.ReaderFrom.
 func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	concurrency := NON_BLOCKING
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
 	if b.buffered() == 0 {
@@ -312,7 +353,7 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 	var m int
 	for {
 		if b.available() == 0 {
-			if err1 := b.flush(BLOCKING, EXPECT_SPACE); err1 != nil {
+			if err1 := b.flush(concurrency, EXPECT_SPACE); err1 != nil {
 				return n, err1
 			}
 		}
@@ -332,6 +373,8 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 		if err != nil {
 			break
 		}
+		// Start blocking concurrent writes as soon as we put some data into b.buf
+		concurrency = BLOCKING
 	}
 	if err == io.EOF {
 		// If we filled the buffer exactly, flush preemptively.

@@ -36,7 +36,7 @@ func TestConcurrentWrites(t *testing.T) {
 			context := fmt.Sprintf("nwrite=%d bufsize=%d", nwrite, bs)
 
 			var wg sync.WaitGroup
-			nroutines := 100
+			nroutines := 1000
 			wg.Add(nroutines)
 			for k := 0; k < nroutines; k++ {
 				go func(index int) {
