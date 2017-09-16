@@ -51,7 +51,7 @@ func TestConcurrentWrites(t *testing.T) {
 				go func(index int) {
 					defer wg.Done()
 
-					switch index % 3 {
+					switch index % 5 {
 					case 0:
 						n, e1 := buf.Write(data[0:nwrite])
 						if e1 != nil || n != nwrite {
@@ -65,9 +65,11 @@ func TestConcurrentWrites(t *testing.T) {
 							return
 						}
 					case 2:
+						//						n, e1 := buf.Write(data[0:nwrite])
 						r := bytes.NewReader(data[0:nwrite])
 						n, e1 := buf.ReadFrom(r)
 						if e1 != nil || n != int64(nwrite) {
+							//						if e1 != nil || n != nwrite {
 							t.Errorf("%s: buf.ReadFrom %d = %d, %v", context, nwrite, n, e1)
 							return
 						}
@@ -97,8 +99,8 @@ func TestConcurrentWrites(t *testing.T) {
 			buf.Flush()
 
 			written := w.Bytes()
-			expected := nroutines / 5 * (5*nwrite + 0 + 0)
-			//			expected := nroutines / 5 * (3*nwrite + 4 + 1)
+			//			expected := nroutines / 4 * (3*nwrite + 4)
+			expected := nroutines / 5 * (3*nwrite + 4 + 1)
 			if len(written) != expected {
 				t.Errorf("%s: %d bytes expected, %d written", context, expected, len(written))
 			}
