@@ -45,13 +45,13 @@ func TestConcurrentWrites(t *testing.T) {
 			context := fmt.Sprintf("nwrite=%d bufsize=%d", nwrite, bs)
 
 			var wg sync.WaitGroup
-			nroutines := 1000
+			nroutines := 100000
 			wg.Add(nroutines)
 			for k := 0; k < nroutines; k++ {
 				go func(index int) {
 					defer wg.Done()
 
-					switch index % 5 {
+					switch index % 3 {
 					case 0:
 						n, e1 := buf.Write(data[0:nwrite])
 						if e1 != nil || n != nwrite {
@@ -97,7 +97,8 @@ func TestConcurrentWrites(t *testing.T) {
 			buf.Flush()
 
 			written := w.Bytes()
-			expected := nroutines / 5 * (3*nwrite + 4 + 1)
+			expected := nroutines / 5 * (5*nwrite + 0 + 0)
+			//			expected := nroutines / 5 * (3*nwrite + 4 + 1)
 			if len(written) != expected {
 				t.Errorf("%s: %d bytes expected, %d written", context, expected, len(written))
 			}

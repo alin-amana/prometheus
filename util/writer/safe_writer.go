@@ -1,7 +1,7 @@
 package writer
 
 import (
-	//	"fmt"
+	//"fmt"
 	"io"
 	"sync"
 	"unicode/utf8"
@@ -149,10 +149,12 @@ func (b *SafeWriter) flush(expect flushExpectation) error {
 
 	// Return if caller expectation has been met.
 	if (expect == EXPECT_FLUSH && b.n == 0) || (expect == EXPECT_SPACE && b.available() > 0) {
+		//fmt.Printf("flush(%#v): not flushing %q\n", expect, b.buf[:b.n])
 		return nil
 	}
 
 	b.nFlushing = b.n
+	//fmt.Printf("flush(%#v): flushing %q\n", expect, b.buf[:b.n])
 
 	mtxReleased := false
 	if b.mode == NON_BLOCKING && b.nFlushing != len(b.buf) {
@@ -178,6 +180,7 @@ func (b *SafeWriter) flush(expect flushExpectation) error {
 	b.n -= n
 	b.err = err
 	b.nFlushing = 0
+	//fmt.Printf("flush(%#v): flushing done %q\n", expect, b.buf[:b.n])
 
 	return b.err
 }
@@ -223,6 +226,10 @@ func (b *SafeWriter) waitIfBlockingWriteInFlight() {
 		b.blocking.Wait()
 	}
 	b.blocking.Signal()
+
+	//	if b.mode == BLOCKING {
+	//		panic("Holy cow!")
+	//	}
 }
 
 // Available returns how many bytes are unused in the buffer.
@@ -253,15 +260,17 @@ func (b *SafeWriter) Write(p []byte) (nn int, err error) {
 	b.waitIfBlockingWriteInFlight()
 
 	for len(p) > b.available() && b.err == nil {
+		// Starting chunked write, begin blocking concurrent writes
+		if b.mode == NON_BLOCKING {
+			defer b.endBlockingWrite(b.beginBlockingWrite())
+		}
+
 		var n int
 		if b.buffered() == 0 {
 			// Large write, empty buffer.
 			// Write directly from p to avoid copy.
 			n, b.err = b.wr.Write(p)
 		} else {
-			// Start blocking concurrent writes as soon as we do a partial write
-			defer b.endBlockingWrite(b.beginBlockingWrite())
-
 			n = copy(b.buf[b.n:], p)
 			b.n += n
 			b.flush(EXPECT_FLUSH)
@@ -320,6 +329,7 @@ func (b *SafeWriter) WriteRune(r rune) (size int, err error) {
 	//	b.waitIfBlockingWriteInFlight()
 	//
 	//	if b.available() < utf8.UTFMax {
+	//		defer b.endBlockingWrite(b.beginBlockingWrite())
 	//		// Actually flush the buffer if there are less than 4 bytes available
 	//		if b.flush(EXPECT_FLUSH); b.err != nil {
 	//			return 0, b.err
@@ -351,7 +361,7 @@ func (b *SafeWriter) WriteString(s string) (int, error) {
 		nn += n
 		s = s[n:]
 		if len(s) > 0 && b.mode == NON_BLOCKING {
-			// Start blocking concurrent writes as soon as we started a partial write
+			// Starting chunked write, begin blocking concurrent writes
 			defer b.endBlockingWrite(b.beginBlockingWrite())
 		}
 		b.flush(EXPECT_SPACE)
@@ -377,8 +387,12 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 			return w.ReadFrom(r)
 		}
 	}
+	//	if b.mode == NON_BLOCKING {
+	//		defer b.endBlockingWrite(b.beginBlockingWrite())
+	//	}
 	var m int
 	for {
+		// Starting chunked write, begin blocking concurrent writes
 		if b.available() == 0 {
 			if err1 := b.flush(EXPECT_SPACE); err1 != nil {
 				return n, err1
@@ -400,10 +414,10 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 		if err != nil {
 			break
 		}
-		// Start blocking concurrent writes as soon as we put some data into b.buf
-		if b.mode == NON_BLOCKING {
-			defer b.endBlockingWrite(b.beginBlockingWrite())
-		}
+		//		// Starting chunked write, begin blocking concurrent writes
+		//		if b.mode == NON_BLOCKING {
+		//			defer b.endBlockingWrite(b.beginBlockingWrite())
+		//		}
 	}
 	if err == io.EOF {
 		// If we filled the buffer exactly, flush preemptively.
