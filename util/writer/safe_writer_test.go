@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 	"testing/iotest"
-	"unicode/utf8"
 )
 
 // An io.Writer and io.ReaderFrom that only accepts a predetermined set of
@@ -218,118 +217,6 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 }
 
-func TestConcurrentWrites(t *testing.T) {
-	var data [1024]byte
-	runedata := '\U0002070E'
-	bdata := byte('X')
-
-	for i := 0; i < len(data); i++ {
-		data[i] = byte('a' + i%('z'-'a'))
-	}
-	stringdata := string(data[:])
-
-	var runebytes [4]byte
-	utf8.EncodeRune(runebytes[:], runedata)
-
-	w := new(bytes.Buffer)
-	for i := 0; i < len(bufsizes); i++ {
-		for j := 0; j < len(bufsizes); j++ {
-			nwrite := bufsizes[i]
-			bs := bufsizes[j]
-			sdata := stringdata[:nwrite]
-
-			// Write nwrite bytes using buffer size bs from each of 100 goroutines.
-			// Check that the right amount makes it out and that the data is correct.
-
-			w.Reset()
-			buf := NewWriterSize(w, bs)
-			context := fmt.Sprintf("nwrite=%d bufsize=%d", nwrite, bs)
-
-			var wg sync.WaitGroup
-			nr := 1000
-			wg.Add(nr)
-			for k := 0; k < nr; k++ {
-				go func(index int) {
-					defer wg.Done()
-
-					switch index % 5 {
-					case 0:
-						n, e1 := buf.Write(data[0:nwrite])
-						if e1 != nil || n != nwrite {
-							t.Errorf("%s: buf.Write = %d, %v", context, n, e1)
-							return
-						}
-					case 1:
-						n, e1 := buf.WriteString(sdata)
-						if e1 != nil || n != nwrite {
-							t.Errorf("%s: buf.WriteString = %d, %v", context, n, e1)
-							return
-						}
-					case 2:
-						r := bytes.NewReader(data[0:nwrite])
-						n, e1 := buf.ReadFrom(r)
-						if e1 != nil || n != int64(nwrite) {
-							t.Errorf("%s: buf.ReadFrom = %d, %v", context, n, e1)
-							return
-						}
-					case 3:
-						n, e1 := buf.WriteRune(runedata)
-						if e1 != nil || n != 4 {
-							t.Errorf("%s: buf.WriteRune = %d, %v", context, n, e1)
-							return
-						}
-					case 4:
-						e1 := buf.WriteByte(bdata)
-						if e1 != nil {
-							t.Errorf("%s: buf.WriteByte = %v", context, e1)
-							return
-						}
-					}
-
-					// Liberally sprinkle some Flush() calls
-					if index%7 == 0 {
-						if e := buf.Flush(); e != nil {
-							t.Errorf("%s: buf.Flush = %v", context, e)
-						}
-					}
-				}(k)
-			}
-			wg.Wait()
-			buf.Flush()
-
-			written := w.Bytes()
-			expected := nr / 5 * (3*nwrite + 4 + 1)
-			if len(written) != expected {
-				t.Errorf("%s: %d bytes expected, %d written", context, expected, len(written))
-			}
-			for l := 0; l < len(written); l++ {
-				var expData []byte
-				switch written[l] {
-				case data[0]:
-					expData = data[:nwrite]
-				case runebytes[0]:
-					expData = runebytes[:]
-				case bdata:
-					expData = []byte{bdata}
-				default:
-					t.Errorf("%s: unexpected byte written @%d: %q", context, l, written[l])
-					t.Errorf("  want %d * %q, %d * %#U, %d * '%c'", 3*nr/5, data[0:nwrite], nr/5, runedata, nr/5, bdata)
-					t.Fatalf("  have=%s", written)
-				}
-				for ll := 0; ll < len(expData); ll++ {
-					if written[l] != expData[ll] {
-						t.Errorf("%s: wrong bytes written @%d: %q expected: %q", context, l, written[l], expData[ll])
-						t.Errorf("  want %d * %q, %d * %#U, %d * '%c'", 3*nr/5, data[0:nwrite], nr/5, runedata, nr/5, bdata)
-						t.Fatalf("  have=%s", written)
-					}
-					l++
-				}
-				l--
-			}
-		}
-	}
-}
-
 func TestConcurrentReset(t *testing.T) {
 	var data [1024]byte
 	for i := 0; i < len(data); i++ {
@@ -339,6 +226,8 @@ func TestConcurrentReset(t *testing.T) {
 	runedata := '\U0002070E'
 	bdata := byte('X')
 
+	w1 := new(bytes.Buffer)
+	w2 := new(bytes.Buffer)
 	for i := 0; i < len(bufsizes); i++ {
 		for j := 0; j < len(bufsizes); j++ {
 			nwrite := bufsizes[i]
@@ -350,23 +239,15 @@ func TestConcurrentReset(t *testing.T) {
 
 			// Write nwrite bytes, an nwrite length string, an nwrite length reader,
 			// a 4 byte rune or one byte, using buffer size bs from nr goroutines.
-
 			nr := 1000
-			var w1, w2 *presetWriter
-			if nwrite == 0 {
-				w1 = NewPresetWriter([]byte(string(runedata)), []byte{bdata})
-				w2 = NewPresetWriter([]byte(string(runedata)), []byte{bdata})
-			} else {
-				w1 = NewPresetWriter(data[:nwrite], []byte(string(runedata)), []byte{bdata})
-				w2 = NewPresetWriter(data[:nwrite], []byte(string(runedata)), []byte{bdata})
-			}
+			w1.Reset()
+			w2.Reset()
 			buf := NewWriterSize(w1, bs)
 			context := fmt.Sprintf("nwrite=%d bufsize=%d", nwrite, bs)
 
 			var wg, wgReset sync.WaitGroup
-			nr := 10
 			wg.Add(nr)
-			wgReset.add(nr/2 - 1)
+			wgReset.Add(nr / 2)
 			for k := 0; k < nr; k++ {
 				go func(index int) {
 					defer wg.Done()
@@ -394,9 +275,10 @@ func TestConcurrentReset(t *testing.T) {
 					}
 
 					// And reset the buffer once, halfway through
-					if index == nr/2 {
+					if index == nr/2-1 {
 						buf.Reset(w2)
-					} else if index < nr/2 {
+					}
+					if index < nr/2 {
 						wgReset.Done()
 					}
 				}(k)
@@ -409,7 +291,7 @@ func TestConcurrentReset(t *testing.T) {
 			if minExpected < 0 {
 				minExpected = 0
 			}
-			actual := w1.written + w2.written
+			actual := w1.Len() + w2.Len()
 			if actual < minExpected || actual > maxExpected {
 				t.Errorf("%s: %d - %d bytes expected, %d written", context, minExpected, maxExpected, actual)
 			}
