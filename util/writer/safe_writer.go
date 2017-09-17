@@ -10,16 +10,45 @@ import (
 const defaultBufSize = 4096
 const maxConsecutiveEmptyReads = 100
 
-// SafeWriter implements highly concurrent buffering for an io.Writer object.
+// Writer implements highly concurrent buffering for an io.Writer object.
 // In particular, writes will not block while a Flush() call is in progress as
 // long as enough buffer space is available.
 //
 // Note however that writes will still block in a number of cases, e.g. when
-// another write, larger than the buffer size, is in progress. Also, concurrent
-// Flush() calls (whether explicit or triggered by the buffer filling up) will
-// block one another.
-type SafeWriter struct {
-	// Protects all fields
+// another write larger than the buffer size (AKA a chunked write), is in
+// progress. Also, concurrent Flush() calls (whether explicit or triggered by
+// the buffer filling up) will block one another.
+//
+// Implementation details:
+//
+// In order to provide write isolation (i.e. make writes appear as if they were
+// issued serially) Writer uses a global mutex to protect all internal state.
+// In the general case, which we will call "base mode", in order to provide high
+// concurrency, the mutex is released just before the write to the underlying
+// io.Writer is issued and reacquired immediately after. A condition variable,
+// notFlushing, is used to ensure at most one goroutine at a time is executing
+// this mutex unprotected sequence of of code.
+//
+// However, if a chunked write is begun by any of the write methods, Writer
+// enters what we'll call "chunked write mode". In this state the goroutine
+// doing the chunked write will never explicitly release the mutex until it
+// completes, in order to prevent race conditions with other writers. But,
+// because of the asynchronous nature of flushes, it may still have to wait
+// for an in flight flush to complete (on a separate, higher priority condition
+// variable, chunkedWriter). sync.Cond.Wait() will implicitly release the mutex,
+// meaning that all other goroutines (except the chunked writer) will have to
+// explicitly check whether in "chunked write mode" every single time they have
+// just acquired the mutex and wait for the in-flight chunked write to complete
+// (on a third condition variable, noChunkedWrite).
+//
+// This arrangement ensures that (1) the chunked writer goroutine has priority
+// over all other writers and flushers; and that (2) whenever a goroutine is
+// holding the mutex it is either (a) the (one) chunked writer when in "chunked
+// write state" or (b) it is a non-chunked writer or flusher and Writer is in
+// the straightforward "base mode" where the mutex and notFlushing provide all
+// necessary concurrency.
+type Writer struct {
+	// Protects all internal state
 	mtx *sync.Mutex
 
 	err error
@@ -29,14 +58,6 @@ type SafeWriter struct {
 
 	// Fields below are only used by flush() (and marginally by Reset()) to
 	// provide correct serialization of writes.
-	//
-	// When a chunked write calls flush() and finds a concurrent flush already
-	// in progress, it sets chunkedWriteInFlight and calls noChunkedWrite.Wait().
-	// When a non-chunked write calls flush() and finds that either (1) a
-	// concurrent flush already in progress; or (2) chunkedWriteInFlight; it calls
-	// notFlushing.Wait().
-	// When a flush() call terminates it calls noChunkedWrite.Signal() iff
-	// chunkedWriteInFlight; or nonBlocking.Signal() otherwise.
 
 	// Number of bytes currently being flushed from the start of buf. Only
 	// non-zero while a flush is in progress. Always <= n.
@@ -46,18 +67,18 @@ type SafeWriter struct {
 	// Condition variable that the only chunked writer is waiting on to flush()
 	chunkedWriter *sync.Cond
 
-	// Whether if a chunked write is in flight
-	chunkedWriteInFlight bool
+	// Whether a chunked write is in flight and Writer is in "chunked write mode"
+	inChunkedWriteMode bool
 	// Condition variable for all goroutines waiting on a chunked write
 	noChunkedWrite *sync.Cond
 }
 
-// NewSafeWriterSize returns a new SafeWriter whose buffer has at least the
-// specified size. If the argument io.Writer is already a SafeWriter with large
-// enough size, it returns the underlying SafeWriter.
-func NewSafeWriterSize(w io.Writer, size int) *SafeWriter {
-	// Is it already a SafeWriter?
-	b, ok := w.(*SafeWriter)
+// NewWriterSize returns a new Writer whose buffer has at least the specified
+// size. If the argument io.Writer is already a Writer with large enough size,
+// it returns the underlying Writer.
+func NewWriterSize(w io.Writer, size int) *Writer {
+	// Is it already a Writer?
+	b, ok := w.(*Writer)
 	if ok && len(b.buf) >= size {
 		return b
 	}
@@ -68,7 +89,7 @@ func NewSafeWriterSize(w io.Writer, size int) *SafeWriter {
 		size = utf8.UTFMax
 	}
 	m := new(sync.Mutex)
-	return &SafeWriter{
+	return &Writer{
 		mtx:            m,
 		buf:            make([]byte, size),
 		wr:             w,
@@ -78,43 +99,47 @@ func NewSafeWriterSize(w io.Writer, size int) *SafeWriter {
 	}
 }
 
-// NewSafeWriter returns a new SafeWriter whose buffer has the default size.
-func NewSafeWriter(w io.Writer) *SafeWriter {
-	return NewSafeWriterSize(w, defaultBufSize)
+// NewWriter returns a new Writer whose buffer has the default size.
+func NewWriter(w io.Writer) *Writer {
+	return NewWriterSize(w, defaultBufSize)
 }
 
 // Reset discards any unflushed buffered data, clears any error, and
 // resets b to write its output to w.
-func (b *SafeWriter) Reset(w io.Writer) {
+func (b *Writer) Reset(w io.Writer) {
 	b.mtx.Lock()
+	b.waitUntilNoChunkedWrite()
 
 	// Wait for in-progress flush() call(s) to complete
 	for b.err == nil && b.nFlush != 0 {
 		b.notFlushing.Wait()
 	}
-	// (Potentially) wake one other goroutine waiting on flush()
-	b.notFlushing.Signal()
 
 	b.err = nil
 	b.n = 0
 	b.wr = w
 	b.nFlush = 0
 	b.mtx.Unlock()
+
+	// (Potentially) wake one other goroutine waiting on flush()
+	b.notFlushing.Signal()
 }
 
 // Flush writes any buffered data to the underlying io.Writer. As long as the
 // buffer has enough available space, writes can proceed concurrently.
-func (b *SafeWriter) Flush() error {
+func (b *Writer) Flush() error {
 	b.mtx.Lock()
 	b.waitUntilNoChunkedWrite()
 
-	err := b.flush(0, false)
+	err := b.flush(0)
 
 	b.mtx.Unlock()
 	return err
 }
 
-func (b *SafeWriter) flush(need int, iAmChunked bool) error {
+func (b *Writer) flush(need int) error {
+	iAmChunked := b.inChunkedWriteMode
+
 	callerNeedMet := func() bool {
 		return b.n == 0 || (need > 0 && b.available() >= need)
 	}
@@ -129,7 +154,7 @@ func (b *SafeWriter) flush(need int, iAmChunked bool) error {
 				waited = true
 			}
 		} else {
-			for b.nFlush != 0 || b.chunkedWriteInFlight {
+			for b.nFlush != 0 || b.inChunkedWriteMode {
 				b.notFlushing.Wait()
 				waited = true
 			}
@@ -137,7 +162,7 @@ func (b *SafeWriter) flush(need int, iAmChunked bool) error {
 		return waited
 	}
 
-	// Loop as long as no error and caller need is not met
+	// Loop as long as no error and caller need is not yet met
 	for b.err == nil && !callerNeedMet() {
 		if waitToFlush() {
 			continue
@@ -170,8 +195,8 @@ func (b *SafeWriter) flush(need int, iAmChunked bool) error {
 		b.err = err
 		b.nFlush = 0
 
-		if mtxReleased && b.chunkedWriteInFlight {
-			// We are not the chunked writer but one exists: wake it and block until
+		if mtxReleased && b.inChunkedWriteMode {
+			// We are not the chunked writer but one exists: wake it and wait until
 			// it is done (else our caller will enter into a race condition with it).
 			b.chunkedWriter.Signal()
 			b.waitUntilNoChunkedWrite()
@@ -189,7 +214,7 @@ func (b *SafeWriter) flush(need int, iAmChunked bool) error {
 }
 
 // Flush writes any buffered data to the underlying io.Writer.
-func (b *SafeWriter) flush2(need int) error {
+func (b *Writer) flush2(need int) error {
 	if b.err != nil {
 		return b.err
 	}
@@ -212,59 +237,57 @@ func (b *SafeWriter) flush2(need int) error {
 	return nil
 }
 
-func (b *SafeWriter) beginChunkedWrite() int {
-	b.chunkedWriteInFlight = true
+func (b *Writer) beginChunkedWrite() int {
+	b.inChunkedWriteMode = true
 	return 0
 }
 
-func (b *SafeWriter) endChunkedWrite(ignored int) {
-	b.chunkedWriteInFlight = false
+func (b *Writer) endChunkedWrite(ignored int) {
+	b.inChunkedWriteMode = false
 	// Wake all goroutines waiting to write
 	b.noChunkedWrite.Signal()
 }
 
-func (b *SafeWriter) waitUntilNoChunkedWrite() {
-	// Wait for any in-progress chunked write to complete
-	for b.chunkedWriteInFlight {
+// Waits for any in-progress chunked write to complete. This is safe to do even
+// in the face of errors, as a chunked write will reset the chunked write mode
+// flag and signal moChunkedWrite regardless of error.
+func (b *Writer) waitUntilNoChunkedWrite() {
+	for b.inChunkedWriteMode {
 		b.noChunkedWrite.Wait()
 	}
 	b.noChunkedWrite.Signal()
-
-	//	if b.chunkedWriteInFlight {
-	//		panic("Holy cow!")
-	//	}
 }
 
 // Available returns how many bytes are unused in the buffer.
-func (b *SafeWriter) Available() int {
+func (b *Writer) Available() int {
 	b.mtx.Lock()
 	res := b.available()
 	b.mtx.Unlock()
 	return res
 }
-func (b *SafeWriter) available() int { return len(b.buf) - b.n }
+func (b *Writer) available() int { return len(b.buf) - b.n }
 
 // Buffered returns the number of bytes that have been written into the current buffer.
-func (b *SafeWriter) Buffered() int {
+func (b *Writer) Buffered() int {
 	b.mtx.Lock()
 	res := b.buffered()
 	b.mtx.Unlock()
 	return res
 }
-func (b *SafeWriter) buffered() int { return b.n }
+func (b *Writer) buffered() int { return b.n }
 
 // Write writes the contents of p into the buffer.
 // It returns the number of bytes written.
 // If nn < len(p), it also returns an error explaining
 // why the write is short.
-func (b *SafeWriter) Write(p []byte) (nn int, err error) {
+func (b *Writer) Write(p []byte) (nn int, err error) {
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
 	b.waitUntilNoChunkedWrite()
 
 	for len(p) > b.available() && b.err == nil {
-		// Starting chunked write, begin blocking concurrent writes
-		if !b.chunkedWriteInFlight {
+		if !b.inChunkedWriteMode {
+			// Enter chunked write mode
 			defer b.endChunkedWrite(b.beginChunkedWrite())
 		}
 
@@ -276,7 +299,7 @@ func (b *SafeWriter) Write(p []byte) (nn int, err error) {
 		} else {
 			n = copy(b.buf[b.n:], p)
 			b.n += n
-			b.flush(1, true)
+			b.flush(1)
 		}
 		nn += n
 		p = p[n:]
@@ -291,7 +314,7 @@ func (b *SafeWriter) Write(p []byte) (nn int, err error) {
 }
 
 // WriteByte writes a single byte.
-func (b *SafeWriter) WriteByte(c byte) error {
+func (b *Writer) WriteByte(c byte) error {
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
 	b.waitUntilNoChunkedWrite()
@@ -300,7 +323,7 @@ func (b *SafeWriter) WriteByte(c byte) error {
 		return b.err
 	}
 
-	if b.available() <= 0 && b.flush(1, false) != nil {
+	if b.available() <= 0 && b.flush(1) != nil {
 		return b.err
 	}
 	b.buf[b.n] = c
@@ -310,7 +333,7 @@ func (b *SafeWriter) WriteByte(c byte) error {
 
 // WriteRune writes a single Unicode code point, returning
 // the number of bytes written and any error.
-func (b *SafeWriter) WriteRune(r rune) (size int, err error) {
+func (b *Writer) WriteRune(r rune) (size int, err error) {
 	if r < utf8.RuneSelf {
 		err = b.WriteByte(byte(r))
 		if err != nil {
@@ -319,35 +342,35 @@ func (b *SafeWriter) WriteRune(r rune) (size int, err error) {
 		return 1, nil
 	}
 
-	var encoded [4]byte
-	size = utf8.EncodeRune(encoded[:], r)
-	return b.Write(encoded[:size])
+	//	var encoded [4]byte
+	//	size = utf8.EncodeRune(encoded[:], r)
+	//	return b.Write(encoded[:size])
 
-	//	b.mtx.Lock()
-	//	defer b.mtx.Unlock()
-	//	b.waitUntilNoChunkedWrite()
-	//
-	//	if b.err != nil {
-	//		return 0, b.err
-	//	}
-	//
-	//	if b.available() < utf8.UTFMax {
-	//		//defer b.endChunkedWrite(b.beginChunkedWrite())
-	//		// Actually flush the buffer if there are less than 4 bytes available
-	//		if b.flush(utf8.UTFMax, false); b.err != nil {
-	//			return 0, b.err
-	//		}
-	//	}
-	//	size = utf8.EncodeRune(b.buf[b.n:], r)
-	//	b.n += size
-	//	return size, nil
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
+	b.waitUntilNoChunkedWrite()
+
+	if b.err != nil {
+		return 0, b.err
+	}
+
+	if b.available() < utf8.UTFMax {
+		//defer b.endChunkedWrite(b.beginChunkedWrite())
+		// Actually flush the buffer if there are less than 4 bytes available
+		if b.flush(utf8.UTFMax); b.err != nil {
+			return 0, b.err
+		}
+	}
+	size = utf8.EncodeRune(b.buf[b.n:], r)
+	b.n += size
+	return size, nil
 }
 
 // WriteString writes a string.
 // It returns the number of bytes written.
 // If the count is less than len(s), it also returns an error explaining
 // why the write is short.
-func (b *SafeWriter) WriteString(s string) (int, error) {
+func (b *Writer) WriteString(s string) (int, error) {
 	nn := 0
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
@@ -362,11 +385,11 @@ func (b *SafeWriter) WriteString(s string) (int, error) {
 		b.n += n
 		nn += n
 		s = s[n:]
-		if !b.chunkedWriteInFlight {
-			// Starting chunked write, begin blocking concurrent writes
+		if !b.inChunkedWriteMode {
+			// Enter chunked write mode
 			defer b.endChunkedWrite(b.beginChunkedWrite())
 		}
-		b.flush(1, true)
+		b.flush(1)
 		if b.err != nil {
 			return nn, b.err
 		}
@@ -379,7 +402,7 @@ func (b *SafeWriter) WriteString(s string) (int, error) {
 }
 
 // ReadFrom implements io.ReaderFrom.
-func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
+func (b *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 	b.mtx.Lock()
 	defer b.mtx.Unlock()
 	b.waitUntilNoChunkedWrite()
@@ -389,14 +412,11 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 			return w.ReadFrom(r)
 		}
 	}
-	// Starting chunked write, begin blocking concurrent writes
-	//	if !b.chunkedWriteInFlight {
-	//		defer b.endChunkedWrite(b.beginChunkedWrite())
-	//	}
+
 	var m int
 	for {
 		if b.available() == 0 {
-			if err1 := b.flush(1, b.chunkedWriteInFlight); err1 != nil {
+			if err1 := b.flush(1); err1 != nil {
 				return n, err1
 			}
 		}
@@ -416,15 +436,15 @@ func (b *SafeWriter) ReadFrom(r io.Reader) (n int64, err error) {
 		if err != nil {
 			break
 		}
-		// Starting chunked write, begin blocking concurrent writes
-		if !b.chunkedWriteInFlight {
+		if !b.inChunkedWriteMode {
+			// Enter chunked write mode
 			defer b.endChunkedWrite(b.beginChunkedWrite())
 		}
 	}
 	if err == io.EOF {
 		// If we filled the buffer exactly, flush preemptively.
 		if b.available() == 0 {
-			err = b.flush(1, b.chunkedWriteInFlight)
+			err = b.flush(1)
 		} else {
 			err = nil
 		}
