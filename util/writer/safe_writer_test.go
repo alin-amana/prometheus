@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 )
@@ -126,6 +127,8 @@ var bufsizes = []int{
 	0, 7, 16, 23, 32, 46, 64, 93, 128, 1024,
 }
 
+// Write bytes, strings, runes, bytes and read from readers concurrently from
+// a number of goroutines, for every combination of write and buffer sizes.
 func TestConcurrentWrites(t *testing.T) {
 	var data [1024]byte
 	for i := 0; i < len(data); i++ {
@@ -217,6 +220,9 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 }
 
+// Reset the buffer before the halfway point to a second writer and ensure
+// both writers only contain valid "records" (with the exception of the
+// last "record" in the first writer).
 func TestConcurrentReset(t *testing.T) {
 	var data [1024]byte
 	for i := 0; i < len(data); i++ {
@@ -226,8 +232,6 @@ func TestConcurrentReset(t *testing.T) {
 	runedata := '\U0002070E'
 	bdata := byte('X')
 
-	w1 := new(bytes.Buffer)
-	w2 := new(bytes.Buffer)
 	for i := 0; i < len(bufsizes); i++ {
 		for j := 0; j < len(bufsizes); j++ {
 			nwrite := bufsizes[i]
@@ -240,8 +244,14 @@ func TestConcurrentReset(t *testing.T) {
 			// Write nwrite bytes, an nwrite length string, an nwrite length reader,
 			// a 4 byte rune or one byte, using buffer size bs from nr goroutines.
 			nr := 1000
-			w1.Reset()
-			w2.Reset()
+			var w1, w2 *presetWriter
+			if nwrite == 0 {
+				w1 = NewPresetWriter([]byte(string(runedata)), []byte{bdata})
+				w2 = NewPresetWriter([]byte(string(runedata)), []byte{bdata})
+			} else {
+				w1 = NewPresetWriter(data[:nwrite], []byte(string(runedata)), []byte{bdata})
+				w2 = NewPresetWriter(data[:nwrite], []byte(string(runedata)), []byte{bdata})
+			}
 			buf := NewWriterSize(w1, bs)
 			context := fmt.Sprintf("nwrite=%d bufsize=%d", nwrite, bs)
 
@@ -251,7 +261,7 @@ func TestConcurrentReset(t *testing.T) {
 			for k := 0; k < nr; k++ {
 				go func(index int) {
 					defer wg.Done()
-					if index > nr/2 {
+					if index >= nr/2 {
 						wgReset.Wait()
 					}
 
@@ -274,7 +284,7 @@ func TestConcurrentReset(t *testing.T) {
 						buf.Flush()
 					}
 
-					// And reset the buffer once, halfway through
+					// And reset the buffer once, before the halfway point
 					if index == nr/2-1 {
 						buf.Reset(w2)
 					}
@@ -286,15 +296,150 @@ func TestConcurrentReset(t *testing.T) {
 			wg.Wait()
 			buf.Flush()
 
+			if err := buf.WriteByte(bdata); err != nil {
+				t.Errorf("%s %v", context, err)
+			}
+
 			maxExpected := nr / 5 * (3*nwrite + 4 + 1)
 			minExpected := maxExpected - bs
 			if minExpected < 0 {
 				minExpected = 0
 			}
-			actual := w1.Len() + w2.Len()
+			actual := w1.written + w2.written
 			if actual < minExpected || actual > maxExpected {
-				t.Errorf("%s: %d - %d bytes expected, %d written", context, minExpected, maxExpected, actual)
+				t.Errorf("%s: %d - %d bytes expected, %d + %d written", context, minExpected, maxExpected, w1.written, w2.written)
 			}
+		}
+	}
+}
+
+// An errorBuffer is like ioutil.Discard and it starts returning errors when its
+// err field is set. It then checks that it never gets written to again.
+type errorBuffer struct {
+	returnError   int32
+	returnedError bool
+}
+
+func (w *errorBuffer) Write(p []byte) (int, error) {
+	if w.returnedError {
+		panic("Already returned error, should not have been called again.")
+	}
+	if atomic.LoadInt32(&w.returnError) != 0 {
+		w.returnedError = true
+		return 0, io.ErrShortWrite
+	}
+	return len(p), nil
+}
+
+// Have 2 writers, one that will start returning an error before 1/4 of
+// the goroutines have completed (and ensure no writes are performed on it
+// again) and a second one that we'll Reset() to before the halfway point
+// and what will check for valid writes.
+func TestConcurrentError(t *testing.T) {
+	var data [1024]byte
+	for i := 0; i < len(data); i++ {
+		data[i] = byte('a' + i%('z'-'a'))
+	}
+	stringdata := string(data[:])
+	runedata := '\U0002070E'
+	bdata := byte('X')
+
+	for i := 0; i < len(bufsizes); i++ {
+		for j := 0; j < len(bufsizes); j++ {
+			nwrite := bufsizes[i]
+			bs := bufsizes[j]
+			if bs == 0 {
+				continue
+			}
+			sdata := stringdata[:nwrite]
+
+			// Write nwrite bytes, an nwrite length string, an nwrite length reader,
+			// a 4 byte rune or one byte, using buffer size bs from nr goroutines.
+			nr := 1000
+			w1 := new(errorBuffer)
+			var w2 *presetWriter
+			if nwrite == 0 {
+				w2 = NewPresetWriter([]byte(string(runedata)), []byte{bdata})
+			} else {
+				w2 = NewPresetWriter(data[:nwrite], []byte(string(runedata)), []byte{bdata})
+			}
+			buf := NewWriterSize(w1, bs)
+			context := fmt.Sprintf("nwrite=%d bufsize=%d", nwrite, bs)
+			var errors int32
+
+			var wg, wgError, wgReset sync.WaitGroup
+			wg.Add(nr)
+			wgError.Add(nr / 4)
+			wgReset.Add(nr / 2)
+			for k := 0; k < nr; k++ {
+				go func(index int) {
+					defer wg.Done()
+					if index >= nr/2 {
+						wgReset.Wait()
+					} else if index >= nr/4 {
+						wgError.Wait()
+					}
+
+					var err error
+					switch index % 5 {
+					case 0:
+						_, err = buf.Write(data[0:nwrite])
+					case 1:
+						_, err = buf.WriteString(sdata)
+					case 2:
+						r := bytes.NewReader(data[0:nwrite])
+						_, err = buf.ReadFrom(r)
+					case 3:
+						_, err = buf.WriteRune(runedata)
+					case 4:
+						err = buf.WriteByte(bdata)
+					}
+
+					// Liberally sprinkle some Flush() calls
+					if err == nil && index%7 == 0 {
+						err = buf.Flush()
+					}
+
+					// Have w return an error before the quarter point
+					if index == nr/4-1 {
+						atomic.StoreInt32(&w1.returnError, 1)
+					}
+					// And reset the buffer to w2, before the halfway point
+					if index == nr/2-1 {
+						// Ensure we hit the underlying writer at least once before reset
+						if err == nil {
+							err = buf.Flush()
+						}
+						buf.Reset(w2)
+					}
+					if index < nr/2 {
+						if index < nr/4 {
+							wgError.Done()
+						}
+						wgReset.Done()
+					}
+
+					if err != nil {
+						atomic.AddInt32(&errors, 1)
+					}
+				}(k)
+			}
+			wg.Wait()
+			buf.Flush()
+
+			minExpected := (nr / 5 * (3*nwrite + 4 + 1)) / 2
+			actual := w2.written
+			if actual < minExpected {
+				t.Errorf("%s: expected at least %d bytes, %d written", context, minExpected, w2.written)
+			}
+			if errors == 0 || int(errors) > nr/2-1 {
+				t.Errorf("%s: expected between 1 and %d errors, got %d", context, nr/2-1, errors)
+			}
+
+			if err := buf.WriteByte(bdata); err != nil {
+				t.Errorf("%s: %v", context, err)
+			}
+			buf.Flush()
 		}
 	}
 }

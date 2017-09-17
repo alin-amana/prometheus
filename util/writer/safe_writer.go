@@ -1,7 +1,6 @@
 package writer
 
 import (
-	//"fmt"
 	"io"
 	"sync"
 	"unicode/utf8"
@@ -56,6 +55,11 @@ type Writer struct {
 	n   int
 	wr  io.Writer
 
+	// Whether a chunked write is in flight and Writer is in "chunked write mode"
+	inChunkedWriteMode bool
+	// Condition variable for all goroutines waiting on a chunked write
+	noChunkedWrite *sync.Cond
+
 	// Fields below are only used by flush() (and marginally by Reset()) to
 	// provide correct serialization of writes.
 
@@ -66,11 +70,6 @@ type Writer struct {
 	notFlushing *sync.Cond
 	// Condition variable that the only chunked writer is waiting on to flush()
 	chunkedWriter *sync.Cond
-
-	// Whether a chunked write is in flight and Writer is in "chunked write mode"
-	inChunkedWriteMode bool
-	// Condition variable for all goroutines waiting on a chunked write
-	noChunkedWrite *sync.Cond
 }
 
 // NewWriterSize returns a new Writer whose buffer has at least the specified
@@ -93,9 +92,9 @@ func NewWriterSize(w io.Writer, size int) *Writer {
 		mtx:            m,
 		buf:            make([]byte, size),
 		wr:             w,
+		noChunkedWrite: sync.NewCond(m),
 		notFlushing:    sync.NewCond(m),
 		chunkedWriter:  sync.NewCond(m),
-		noChunkedWrite: sync.NewCond(m),
 	}
 }
 
@@ -105,13 +104,14 @@ func NewWriter(w io.Writer) *Writer {
 }
 
 // Reset discards any unflushed buffered data, clears any error, and
-// resets b to write its output to w.
+// resets b to write its output to w. If w.err is nil, in order to ensure
+// no partial writes end up in w, it waits until any chunked write and/or
+// flush complete before the output is redirected.
 func (b *Writer) Reset(w io.Writer) {
 	b.mtx.Lock()
-	b.waitUntilNoChunkedWrite()
 
-	// Wait for in-progress flush() call(s) to complete
-	for b.err == nil && b.nFlush != 0 {
+	// Wait until there are no chunked writes or flushes in progress
+	for b.err == nil && (b.nFlush != 0 || b.inChunkedWriteMode) {
 		b.notFlushing.Wait()
 	}
 
@@ -137,6 +137,8 @@ func (b *Writer) Flush() error {
 	return err
 }
 
+// Flushing implementation: need is the minimum availabla buffer space expected
+// by the caller.
 func (b *Writer) flush(need int) error {
 	iAmChunked := b.inChunkedWriteMode
 
@@ -145,7 +147,7 @@ func (b *Writer) flush(need int) error {
 	}
 
 	// Waits for any in-progress flush() to complete, returns true iff mtx was
-	// released in the process (i.e. if any Wait() call was made).
+	// released and reaxquired in the process (i.e. if any Wait() call was made).
 	waitToFlush := func() bool {
 		waited := false
 		if iAmChunked {
@@ -203,7 +205,7 @@ func (b *Writer) flush(need int) error {
 		}
 
 		if need == 0 {
-			// Flush() call, no actual buffer space required, all done
+			// Flush() call, no specific buffer space requirement, all done
 			break
 		}
 	}
@@ -237,12 +239,8 @@ func (b *Writer) flush2(need int) error {
 	return nil
 }
 
-func (b *Writer) beginChunkedWrite() int {
-	b.inChunkedWriteMode = true
-	return 0
-}
-
-func (b *Writer) endChunkedWrite(ignored int) {
+// Resets the inChunkedWriteMode flag and wakes a goroutine waiting to write.
+func (b *Writer) endChunkedWrite() {
 	b.inChunkedWriteMode = false
 	// Wake all goroutines waiting to write
 	b.noChunkedWrite.Signal()
@@ -288,7 +286,8 @@ func (b *Writer) Write(p []byte) (nn int, err error) {
 	for len(p) > b.available() && b.err == nil {
 		if !b.inChunkedWriteMode {
 			// Enter chunked write mode
-			defer b.endChunkedWrite(b.beginChunkedWrite())
+			b.inChunkedWriteMode = true
+			defer b.endChunkedWrite()
 		}
 
 		var n int
@@ -342,28 +341,9 @@ func (b *Writer) WriteRune(r rune) (size int, err error) {
 		return 1, nil
 	}
 
-	//	var encoded [4]byte
-	//	size = utf8.EncodeRune(encoded[:], r)
-	//	return b.Write(encoded[:size])
-
-	b.mtx.Lock()
-	defer b.mtx.Unlock()
-	b.waitUntilNoChunkedWrite()
-
-	if b.err != nil {
-		return 0, b.err
-	}
-
-	if b.available() < utf8.UTFMax {
-		//defer b.endChunkedWrite(b.beginChunkedWrite())
-		// Actually flush the buffer if there are less than 4 bytes available
-		if b.flush(utf8.UTFMax); b.err != nil {
-			return 0, b.err
-		}
-	}
-	size = utf8.EncodeRune(b.buf[b.n:], r)
-	b.n += size
-	return size, nil
+	var encoded [4]byte
+	size = utf8.EncodeRune(encoded[:], r)
+	return b.Write(encoded[:size])
 }
 
 // WriteString writes a string.
@@ -387,14 +367,14 @@ func (b *Writer) WriteString(s string) (int, error) {
 		s = s[n:]
 		if !b.inChunkedWriteMode {
 			// Enter chunked write mode
-			defer b.endChunkedWrite(b.beginChunkedWrite())
+			b.inChunkedWriteMode = true
+			defer b.endChunkedWrite()
 		}
 		b.flush(1)
 		if b.err != nil {
 			return nn, b.err
 		}
 	}
-	//	fmt.Printf("s = \"%s\" available = %d\n", s, b.available())
 	n := copy(b.buf[b.n:], s)
 	b.n += n
 	nn += n
@@ -438,7 +418,8 @@ func (b *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 		}
 		if !b.inChunkedWriteMode {
 			// Enter chunked write mode
-			defer b.endChunkedWrite(b.beginChunkedWrite())
+			b.inChunkedWriteMode = true
+			defer b.endChunkedWrite()
 		}
 	}
 	if err == io.EOF {
