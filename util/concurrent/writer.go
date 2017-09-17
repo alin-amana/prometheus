@@ -215,8 +215,8 @@ func (b *Writer) flush(need int) error {
 	return b.err
 }
 
-// Flush writes any buffered data to the underlying io.Writer.
-func (b *Writer) flush2(need int) error {
+// Straightforward implementation, no mutex release, for benchmarking purposes.
+func (b *Writer) flush_simple(need int) error {
 	if b.err != nil {
 		return b.err
 	}
