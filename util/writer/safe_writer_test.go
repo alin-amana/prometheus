@@ -127,14 +127,14 @@ var bufsizes = []int{
 	0, 7, 16, 23, 32, 46, 64, 93, 128, 1024,
 }
 
-func TestConcurrentWrites2(t *testing.T) {
+func TestConcurrentWrites(t *testing.T) {
 	var data [1024]byte
 	for i := 0; i < len(data); i++ {
 		data[i] = byte('a' + i%('z'-'a'))
 	}
 	stringdata := string(data[:])
-	bdata := byte('X')
 	runedata := '\U0002070E'
+	bdata := byte('X')
 
 	for i := 0; i < len(bufsizes); i++ {
 		for j := 0; j < len(bufsizes); j++ {
@@ -332,19 +332,13 @@ func TestConcurrentWrites(t *testing.T) {
 
 func TestConcurrentReset(t *testing.T) {
 	var data [1024]byte
-	runedata := '\U0002070E'
-	bdata := byte('X')
-
 	for i := 0; i < len(data); i++ {
 		data[i] = byte('a' + i%('z'-'a'))
 	}
 	stringdata := string(data[:])
+	runedata := '\U0002070E'
+	bdata := byte('X')
 
-	var runebytes [4]byte
-	utf8.EncodeRune(runebytes[:], runedata)
-
-	w := new(bytes.Buffer)
-	w2 := new(bytes.Buffer)
 	for i := 0; i < len(bufsizes); i++ {
 		for j := 0; j < len(bufsizes); j++ {
 			nwrite := bufsizes[i]
@@ -354,20 +348,31 @@ func TestConcurrentReset(t *testing.T) {
 			}
 			sdata := stringdata[:nwrite]
 
-			// Write nwrite bytes using buffer size bs from each of 100 goroutines.
-			// Check that the right amount makes it out and that the data is correct.
+			// Write nwrite bytes, an nwrite length string, an nwrite length reader,
+			// a 4 byte rune or one byte, using buffer size bs from nr goroutines.
 
-			w.Reset()
-			w2.Reset()
-			buf := NewWriterSize(w, bs)
+			nr := 1000
+			var w1, w2 *presetWriter
+			if nwrite == 0 {
+				w1 = NewPresetWriter([]byte(string(runedata)), []byte{bdata})
+				w2 = NewPresetWriter([]byte(string(runedata)), []byte{bdata})
+			} else {
+				w1 = NewPresetWriter(data[:nwrite], []byte(string(runedata)), []byte{bdata})
+				w2 = NewPresetWriter(data[:nwrite], []byte(string(runedata)), []byte{bdata})
+			}
+			buf := NewWriterSize(w1, bs)
 			context := fmt.Sprintf("nwrite=%d bufsize=%d", nwrite, bs)
 
-			var wg sync.WaitGroup
+			var wg, wgReset sync.WaitGroup
 			nr := 10
 			wg.Add(nr)
+			wgReset.add(nr/2 - 1)
 			for k := 0; k < nr; k++ {
 				go func(index int) {
 					defer wg.Done()
+					if index > nr/2 {
+						wgReset.Wait()
+					}
 
 					switch index % 5 {
 					case 0:
@@ -388,9 +393,11 @@ func TestConcurrentReset(t *testing.T) {
 						buf.Flush()
 					}
 
-					// And reset the buffer once
+					// And reset the buffer once, halfway through
 					if index == nr/2 {
 						buf.Reset(w2)
+					} else if index < nr/2 {
+						wgReset.Done()
 					}
 				}(k)
 			}
@@ -402,34 +409,9 @@ func TestConcurrentReset(t *testing.T) {
 			if minExpected < 0 {
 				minExpected = 0
 			}
-			actual := w.Len() + w2.Len()
+			actual := w1.written + w2.written
 			if actual < minExpected || actual > maxExpected {
 				t.Errorf("%s: %d - %d bytes expected, %d written", context, minExpected, maxExpected, actual)
-			}
-			written := w2.Bytes()
-			for l := 0; l < len(written); l++ {
-				var expData []byte
-				switch written[l] {
-				case data[0]:
-					expData = data[:nwrite]
-				case runebytes[0]:
-					expData = runebytes[:]
-				case bdata:
-					expData = []byte{bdata}
-				default:
-					t.Errorf("%s: unexpected byte written @%d: %q", context, l, written[l])
-					t.Errorf("  want %d * %q, %d * %#U, %d * '%c'", 3*nr/5, data[0:nwrite], nr/5, runedata, nr/5, bdata)
-					t.Fatalf("  have=%s", written)
-				}
-				for ll := 0; ll < len(expData); ll++ {
-					if written[l] != expData[ll] {
-						t.Errorf("%s: wrong bytes written @%d: %q expected: %q", context, l, written[l], expData[ll])
-						t.Errorf("  want %d * %q, %d * %#U, %d * '%c'", 3*nr/5, data[0:nwrite], nr/5, runedata, nr/5, bdata)
-						t.Fatalf("  have=\n%s\n%s", w.Bytes(), w2.Bytes())
-					}
-					l++
-				}
-				l--
 			}
 		}
 	}
